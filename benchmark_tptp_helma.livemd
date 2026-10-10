@@ -1,0 +1,222 @@
+# TPTP ATP Benchmark on Helma
+
+This notebook runs a TPTP benchmark on the Helma HPC cluster and compares the following automated theorem provers:
+
+- LEO-II
+- Zipperposition
+- E-Prover
+- Vampire
+- LEO-III
+- ShotTx
+
+The benchmark runner handles TPTP preparation, prover images, SLURM execution, result collection, and reporting.
+
+---
+
+## 1. Install the benchmark runner
+
+```elixir
+Mix.install([
+  {:atp_benchmark_runner,
+   github: "penthooose/atp_benchmark_runner",
+   force: true}
+])
+```
+
+---
+
+## 2. Configure the environment
+
+```elixir
+setup =
+  AtpBenchmarkRunner.prepare_livebook_setup(
+    submit_label: "Setup"
+  )
+
+env_map = setup.env_map
+env_file = setup.env_file
+ssh_key_path = setup.ssh_key_path
+```
+
+---
+
+## 3. Connect to Helma
+
+```elixir
+boot =
+  HpcConnect.bootstrap(
+    mode: :local,
+    env_file: env_file,
+    cluster: env_map["HPC_CONNECT_CLUSTER"] || "helma",
+    username: env_map["HPC_CONNECT_USERNAME"],
+    key_path: env_map["HPC_CONNECT_IDENTITY_FILE"]
+  )
+
+session = boot.session
+
+IO.inspect(
+  %{
+    cluster: session.cluster.name,
+    ssh_alias: session.ssh_alias,
+    username: session.username,
+    work_dir: session.work_dir,
+    vault_dir: session.vault_dir
+  },
+  label: "Resolved HPC session"
+)
+```
+
+---
+
+## 4. Prepare TPTP and select provers
+
+Download and extract the official TPTP archive if it is not already available.
+
+```elixir
+archive_result =
+  AtpBenchmarkRunner.ensure_tptp_archive()
+
+IO.inspect(
+  archive_result,
+  label: "TPTP archive"
+)
+```
+
+Load all problems from the installed TPTP library.
+
+Axiom files are excluded because the benchmark operates on TPTP problems.
+
+```elixir
+problems =
+  AtpBenchmarkRunner.load_tptp_problems(
+    include_axioms: false
+  )
+
+selected_provers = [
+  :leo2,
+  :zipperposition,
+  :eprover,
+  :vampire,
+  :leo3,
+  :shot_tx
+]
+
+available_provers =
+  AtpBenchmarkRunner.Provers.names()
+
+missing_provers =
+  selected_provers -- available_provers
+
+if missing_provers != [] do
+  raise "Unavailable provers: #{inspect(missing_provers)}"
+end
+
+summary =
+  AtpBenchmarkRunner.TPTP.summarize(problems)
+
+IO.inspect(
+  summary,
+  label: "TPTP problem summary"
+)
+
+IO.puts("")
+IO.puts("Problems: #{length(problems)}")
+IO.puts("Provers: #{length(selected_provers)}")
+
+IO.puts(
+  "Prover/problem combinations: " <>
+    "#{length(problems) * length(selected_provers)}"
+)
+
+IO.puts("")
+IO.puts("Selected provers:")
+
+Enum.each(selected_provers, fn prover ->
+  IO.puts("  - #{prover}")
+end)
+```
+
+---
+
+## 5. Run the benchmark on Helma
+
+The benchmark uses one Helma CPU node and executes prover tasks in parallel.
+
+Missing Apptainer prover images are prepared automatically before execution.
+
+```elixir
+plan =
+  AtpBenchmarkRunner.bootstrap(
+    session,
+    selected_provers,
+    problems,
+    mode: :hpc,
+    hpc_mode: :single_node,
+    single_node_mode: :parallel,
+    node_size: :half,
+    max_parallel_jobs: 6,
+    timeout_seconds: 30,
+    prepare_images: true,
+    extended_debug: false
+  )
+
+IO.puts("Run ID: #{plan.id}")
+IO.puts("Problems: #{length(problems)}")
+IO.puts("Provers: #{length(selected_provers)}")
+
+IO.puts(
+  "Prover/problem combinations: " <>
+    "#{length(problems) * length(selected_provers)}"
+)
+
+results =
+  AtpBenchmarkRunner.run_benchmark(plan)
+```
+
+---
+
+## 6. Results
+
+```elixir
+report =
+  AtpBenchmarkRunner.report(
+    results,
+    plan
+  )
+
+AtpBenchmarkRunner.print_report_markdown(
+  report
+)
+```
+
+### Prover comparison
+
+```elixir
+IO.puts("| Prover | Total | Solved | Failed | Solve Rate |")
+IO.puts("|--------|------:|-------:|-------:|-----------:|")
+
+Enum.each(report.by_prover, fn result ->
+  IO.puts(
+    "| #{result.prover} | " <>
+      "#{result.total} | " <>
+      "#{result.solved} | " <>
+      "#{result.failed} | " <>
+      "#{Float.round(result.solve_rate * 100, 1)}% |"
+  )
+end)
+```
+
+### Persist benchmark results
+
+```elixir
+paths =
+  AtpBenchmarkRunner.persist_run!(
+    plan,
+    results,
+    report
+  )
+
+IO.puts("Run: #{paths.run_path}")
+IO.puts("Results: #{paths.results_path}")
+IO.puts("Report: #{paths.report_path}")
+```
