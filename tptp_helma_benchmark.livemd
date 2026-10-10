@@ -1,0 +1,798 @@
+# Christoph TPTP Benchmark on Helma
+
+This notebook compares the six theorem provers requested for the TPTP benchmark:
+
+- LEO-II
+- Zipperposition
+- E-Prover
+- Vampire
+- LEO-III
+- ShotTx
+
+The workflow is deliberately split into two phases:
+
+1. Small smoke test to verify that Helma, the prover images, SLURM, and result collection all work.
+2. Full TPTP benchmark only after the smoke test succeeds.
+
+> Do not enable the full benchmark until the small test has been checked.
+
+---
+
+## 0. Install ATP Benchmark Runner
+
+```elixir
+Mix.install([
+  {:atp_benchmark_runner,
+   github: "penthooose/atp_benchmark_runner",
+   force: true}
+])
+```
+
+---
+
+## 1. Configure Livebook and Helma access
+
+This opens the ATP benchmark setup form.
+
+Enter the same Helma username and SSH key that you normally use.
+
+```elixir
+setup =
+  AtpBenchmarkRunner.prepare_livebook_setup(
+    submit_label: "Setup"
+  )
+
+env_map = setup.env_map
+env_file = setup.env_file
+ssh_key_path = setup.ssh_key_path
+
+IO.puts("Setup completed.")
+IO.puts("Cluster: #{env_map["HPC_CONNECT_CLUSTER"]}")
+IO.puts("Username: #{env_map["HPC_CONNECT_USERNAME"]}")
+IO.puts("TPTP root: #{env_map["TPTP_ROOT"]}")
+```
+
+---
+
+## 2. Connect to Helma
+
+```elixir
+boot =
+  HpcConnect.bootstrap(
+    mode: :local,
+    env_file: env_file,
+    cluster: env_map["HPC_CONNECT_CLUSTER"] || "helma",
+    username: env_map["HPC_CONNECT_USERNAME"],
+    key_path: env_map["HPC_CONNECT_IDENTITY_FILE"]
+  )
+
+session = boot.session
+
+IO.inspect(
+  %{
+    cluster: session.cluster.name,
+    ssh_alias: session.ssh_alias,
+    username: session.username,
+    work_dir: session.work_dir,
+    vault_dir: session.vault_dir
+  },
+  label: "Resolved HPC session"
+)
+```
+
+---
+
+## 3. Select Christoph's six provers
+
+```elixir
+selected_provers = [
+  :leo2,
+  :zipperposition,
+  :eprover,
+  :vampire,
+  :leo3,
+  :shot_tx
+]
+
+IO.puts("Selected provers:")
+
+Enum.each(selected_provers, fn prover ->
+  IO.puts("  - #{prover}")
+end)
+```
+
+---
+
+## 4. Check that all six provers exist in Paul's runner
+
+```elixir
+available_provers = AtpBenchmarkRunner.Provers.names()
+
+IO.inspect(available_provers, label: "Provers available in ATP Benchmark Runner")
+
+missing_provers =
+  Enum.reject(selected_provers, fn prover ->
+    prover in available_provers
+  end)
+
+if missing_provers == [] do
+  IO.puts("✅ All six requested provers are available.")
+else
+  IO.puts("❌ Missing provers:")
+  IO.inspect(missing_provers)
+end
+```
+
+---
+
+# PHASE A — SMALL TEST
+
+Before running thousands of TPTP problems, test the complete system with five small problems.
+
+---
+
+## 5. Download five small TPTP problems
+
+```elixir
+smoke_problem_names = [
+  "GRP002+0.p",
+  "GRP003+0.p",
+  "LAT001+0.p",
+  "PUZ001+0.p",
+  "REL001+0.p"
+]
+
+{downloaded_smoke, smoke_download_warnings} =
+  AtpBenchmarkRunner.download_tptp_problems!(
+    smoke_problem_names,
+    force: false
+  )
+
+IO.puts("Downloaded #{length(downloaded_smoke)} smoke-test problems.")
+
+Enum.each(downloaded_smoke, fn problem ->
+  IO.puts(
+    "✅ #{problem.name} | status=#{problem.expected_status} | rating=#{problem.rating}"
+  )
+end)
+
+if smoke_download_warnings == [] do
+  IO.puts("✅ No download warnings.")
+else
+  IO.puts("⚠️ Download warnings:")
+
+  Enum.each(smoke_download_warnings, fn warning ->
+    IO.inspect(warning)
+  end)
+end
+```
+
+---
+
+## 6. Select the smoke-test problems
+
+```elixir
+smoke_problems =
+  AtpBenchmarkRunner.select_problems(
+    names: smoke_problem_names
+  )
+
+IO.puts("Selected #{length(smoke_problems)} problems.")
+
+Enum.each(smoke_problems, fn problem ->
+  IO.puts("  - #{problem.name}")
+end)
+
+IO.puts("")
+IO.puts(
+  "Expected prover/problem attempts: #{length(selected_provers) * length(smoke_problems)}"
+)
+```
+
+For five problems and six provers, this should say:
+
+`30`
+
+---
+
+## 7. Inspect the required Helma prover images
+
+```elixir
+prover_structs =
+  Enum.map(
+    selected_provers,
+    &AtpBenchmarkRunner.Prover.builtin!/1
+  )
+
+image_plan =
+  AtpBenchmarkRunner.image_build_plan(
+    session,
+    prover_structs
+  )
+
+IO.inspect(
+  image_plan,
+  label: "Remote image build plan",
+  limit: :infinity
+)
+```
+
+---
+
+## 8. Prepare missing prover images
+
+### SAFETY SWITCH
+
+Leave this as `false` until the image plan above has been checked.
+
+When ready, change:
+
+`prepare_images_now? = false`
+
+to:
+
+`prepare_images_now? = true`
+
+and run this cell.
+
+```elixir
+prepare_images_now? = false
+
+image_build_result =
+  if prepare_images_now? do
+    IO.puts("Preparing prover images on Helma...")
+
+    AtpBenchmarkRunner.build_prover_images!(
+      session,
+      prover_structs,
+      install_scripts: false,
+      force: false,
+      build_on_login_node: false
+    )
+  else
+    IO.puts("Image build NOT started.")
+    IO.puts("Change prepare_images_now? to true only when ready.")
+    :not_started
+  end
+
+IO.inspect(image_build_result, label: "Image preparation result")
+```
+
+---
+
+## 9. Validate the prover images
+
+Run this only after the required images exist.
+
+### SAFETY SWITCH
+
+```elixir
+validate_images_now? = false
+
+image_validation_result =
+  if validate_images_now? do
+    IO.puts("Smoke-validating the six prover images...")
+
+    AtpBenchmarkRunner.smoke_validate_images!(
+      session,
+      prover_structs
+    )
+  else
+    IO.puts("Image validation NOT started.")
+    IO.puts("Change validate_images_now? to true when ready.")
+    :not_started
+  end
+
+IO.inspect(
+  image_validation_result,
+  label: "Image validation result",
+  limit: :infinity
+)
+```
+
+---
+
+## 10. Create the small Helma benchmark plan
+
+This does not yet run the benchmark.
+
+```elixir
+smoke_plan =
+  AtpBenchmarkRunner.bootstrap(
+    session,
+    selected_provers,
+    smoke_problems,
+    mode: :hpc,
+    hpc_mode: :single_node,
+    single_node_mode: :sequential,
+    node_size: :half,
+    timeout_seconds: 30,
+    wait_for_completion: false,
+    prepare_images: false,
+    extended_debug: false
+  )
+
+IO.puts("✅ Smoke benchmark plan created.")
+IO.puts("Run ID: #{smoke_plan.id}")
+IO.puts("Provers: #{length(selected_provers)}")
+IO.puts("Problems: #{length(smoke_problems)}")
+IO.puts(
+  "Attempts: #{length(selected_provers) * length(smoke_problems)}"
+)
+
+IO.inspect(
+  smoke_plan.metadata[:hpc],
+  label: "HPC configuration"
+)
+```
+
+---
+
+## 11. RUN the small benchmark
+
+### SAFETY SWITCH
+
+Do not change this to `true` until Steps 1–10 are confirmed.
+
+```elixir
+run_smoke_benchmark? = false
+
+smoke_results =
+  if run_smoke_benchmark? do
+    IO.puts("Starting SMALL Helma benchmark...")
+    IO.puts("Run ID: #{smoke_plan.id}")
+
+    AtpBenchmarkRunner.run_benchmark(smoke_plan)
+  else
+    IO.puts("Small benchmark NOT started.")
+    IO.puts("Change run_smoke_benchmark? to true when ready.")
+    []
+  end
+
+IO.puts("Collected #{length(smoke_results)} results.")
+```
+
+A complete small run should eventually give approximately:
+
+`30 results`
+
+because:
+
+`6 provers × 5 problems = 30`
+
+---
+
+## 12. Small-run results table
+
+```elixir
+if smoke_results == [] do
+  IO.puts("No smoke-test results yet.")
+else
+  AtpBenchmarkRunner.results_table(
+    smoke_results,
+    memory: true
+  )
+end
+```
+
+---
+
+## 13. Small-run report
+
+```elixir
+smoke_report =
+  if smoke_results == [] do
+    nil
+  else
+    AtpBenchmarkRunner.report(
+      smoke_results,
+      smoke_plan
+    )
+  end
+
+if smoke_report do
+  IO.puts("Run ID: #{smoke_report.run_id}")
+  IO.puts("Generated: #{smoke_report.generated_at}")
+  IO.puts("")
+
+  AtpBenchmarkRunner.print_report_markdown(
+    smoke_report
+  )
+else
+  IO.puts("No report yet.")
+end
+```
+
+---
+
+## 14. Comparison by prover
+
+```elixir
+if smoke_report do
+  IO.puts("| Prover | Total | Solved | Failed | Solve Rate |")
+  IO.puts("|--------|------:|-------:|-------:|-----------:|")
+
+  Enum.each(smoke_report.by_prover, fn prover_result ->
+    IO.puts(
+      "| #{prover_result.prover} | " <>
+        "#{prover_result.total} | " <>
+        "#{prover_result.solved} | " <>
+        "#{prover_result.failed} | " <>
+        "#{Float.round(prover_result.solve_rate * 100, 1)}% |"
+    )
+  end)
+else
+  IO.puts("Run the smoke benchmark first.")
+end
+```
+
+---
+
+## 15. Compare the provers problem by problem
+
+```elixir
+if smoke_report do
+  AtpBenchmarkRunner.print_per_problem(
+    smoke_report
+  )
+else
+  IO.puts("No smoke report yet.")
+end
+```
+
+---
+
+## 16. Inspect errors or unusual results
+
+```elixir
+if smoke_results != [] do
+  AtpBenchmarkRunner.print_interesting(
+    smoke_results
+  )
+else
+  IO.puts("No results yet.")
+end
+```
+
+---
+
+# PHASE B — FULL TPTP PREPARATION
+
+Do not start this phase until all six provers work in Phase A.
+
+Paul's runner can download and extract the official full TPTP archive.
+
+---
+
+## 17. Show the official TPTP archive information
+
+```elixir
+archives =
+  AtpBenchmarkRunner.tptp_archives()
+
+IO.inspect(
+  archives,
+  label: "Official TPTP archives",
+  limit: :infinity
+)
+
+IO.puts("")
+IO.puts("Local TPTP root:")
+IO.puts(System.get_env("TPTP_ROOT") || "not configured")
+```
+
+---
+
+## 18. Download and extract the official TPTP archive
+
+### IMPORTANT SAFETY SWITCH
+
+Keep this `false` until we have checked the smoke-test results.
+
+```elixir
+download_full_tptp? = false
+
+full_archive_result =
+  if download_full_tptp? do
+    IO.puts("Downloading/extracting the official TPTP archive...")
+
+    AtpBenchmarkRunner.ensure_tptp_archive()
+  else
+    IO.puts("Full TPTP download NOT started.")
+    IO.puts("Change download_full_tptp? to true only when ready.")
+    :not_started
+  end
+
+IO.inspect(
+  full_archive_result,
+  label: "Full TPTP archive result"
+)
+```
+
+---
+
+## 19. Inspect how many TPTP problems are available
+
+This cell is safe. It does not submit a benchmark.
+
+```elixir
+all_tptp_problems =
+  AtpBenchmarkRunner.load_tptp_problems()
+
+IO.puts(
+  "TPTP problems currently available: #{length(all_tptp_problems)}"
+)
+
+all_tptp_problems
+|> Enum.take(20)
+|> Enum.each(fn problem ->
+  IO.puts("  - #{problem.name}")
+end)
+```
+
+This number is extremely important.
+
+We will inspect it before starting the real benchmark.
+
+---
+
+# PHASE C — FULL BENCHMARK
+
+Do not run this until the smoke test and TPTP problem count have been reviewed.
+
+---
+
+## 20. Prepare the full benchmark problem set
+
+```elixir
+full_problems = all_tptp_problems
+
+full_attempt_count =
+  length(full_problems) *
+    length(selected_provers)
+
+IO.puts("Full TPTP problems: #{length(full_problems)}")
+IO.puts("Provers: #{length(selected_provers)}")
+IO.puts("Potential prover/problem attempts: #{full_attempt_count}")
+```
+
+---
+
+## 21. Full benchmark configuration
+
+This only creates the plan.
+
+It does NOT start the benchmark.
+
+We will review these settings before using them.
+
+```elixir
+full_plan =
+  AtpBenchmarkRunner.bootstrap(
+    session,
+    selected_provers,
+    full_problems,
+    mode: :hpc,
+    hpc_mode: :single_node,
+    single_node_mode: :parallel,
+    node_size: :half,
+    max_parallel_jobs: 6,
+    timeout_seconds: 30,
+    wait_for_completion: false,
+    prepare_images: false,
+    extended_debug: false
+  )
+
+IO.puts("FULL benchmark plan prepared.")
+IO.puts("Run ID: #{full_plan.id}")
+IO.puts("Problems: #{length(full_problems)}")
+IO.puts("Provers: #{length(selected_provers)}")
+IO.puts("Attempts: #{full_attempt_count}")
+
+IO.inspect(
+  full_plan.metadata[:hpc],
+  label: "Full HPC configuration"
+)
+```
+
+---
+
+## 22. START FULL TPTP BENCHMARK
+
+### BIG SAFETY SWITCH
+
+LEAVE THIS FALSE.
+
+We will only change it after reviewing:
+
+- all six prover images
+- the smoke-test results
+- the number of TPTP problems
+- total number of prover/problem attempts
+- Helma execution configuration
+
+```elixir
+START_FULL_BENCHMARK = false
+
+full_results =
+  if START_FULL_BENCHMARK do
+    IO.puts("Starting FULL TPTP benchmark...")
+    IO.puts("Run ID: #{full_plan.id}")
+    IO.puts("Problems: #{length(full_problems)}")
+    IO.puts("Provers: #{length(selected_provers)}")
+    IO.puts("Attempts: #{full_attempt_count}")
+
+    AtpBenchmarkRunner.run_benchmark(
+      full_plan
+    )
+  else
+    IO.puts("FULL BENCHMARK NOT STARTED.")
+    IO.puts("")
+    IO.puts("This is intentional.")
+    IO.puts(
+      "Do not change START_FULL_BENCHMARK until the configuration has been checked."
+    )
+
+    []
+  end
+```
+
+---
+
+## 23. Recover the latest Helma run if Livebook disconnects
+
+Do NOT use this unless a benchmark was already submitted.
+
+```elixir
+recover_last_run? = false
+
+recovered_results =
+  if recover_last_run? do
+    AtpBenchmarkRunner.collect_last_hpc_results!(
+      session
+    )
+  else
+    IO.puts("Recovery not requested.")
+    []
+  end
+
+IO.puts(
+  "Recovered #{length(recovered_results)} results."
+)
+```
+
+---
+
+## 24. Full benchmark results
+
+```elixir
+final_results =
+  cond do
+    full_results != [] ->
+      full_results
+
+    recovered_results != [] ->
+      recovered_results
+
+    true ->
+      []
+  end
+
+if final_results == [] do
+  IO.puts("No full benchmark results available yet.")
+else
+  AtpBenchmarkRunner.results_table(
+    final_results,
+    memory: true
+  )
+end
+```
+
+---
+
+## 25. Full benchmark report
+
+```elixir
+full_report =
+  if final_results == [] do
+    nil
+  else
+    AtpBenchmarkRunner.report(
+      final_results,
+      full_plan
+    )
+  end
+
+if full_report do
+  AtpBenchmarkRunner.print_report_markdown(
+    full_report
+  )
+else
+  IO.puts("No full report available yet.")
+end
+```
+
+---
+
+## 26. Final prover scoreboard
+
+```elixir
+if full_report do
+  IO.puts("| Prover | Total | Solved | Failed | Solve Rate |")
+  IO.puts("|--------|------:|-------:|-------:|-----------:|")
+
+  Enum.each(full_report.by_prover, fn prover_result ->
+    IO.puts(
+      "| #{prover_result.prover} | " <>
+        "#{prover_result.total} | " <>
+        "#{prover_result.solved} | " <>
+        "#{prover_result.failed} | " <>
+        "#{Float.round(prover_result.solve_rate * 100, 1)}% |"
+    )
+  end)
+else
+  IO.puts("No full benchmark report yet.")
+end
+```
+
+---
+
+## 27. Full per-problem comparison
+
+```elixir
+if full_report do
+  AtpBenchmarkRunner.print_per_problem(
+    full_report
+  )
+else
+  IO.puts("No full benchmark report yet.")
+end
+```
+
+---
+
+## 28. Inspect interesting failures/timeouts
+
+```elixir
+if final_results != [] do
+  AtpBenchmarkRunner.print_interesting(
+    final_results
+  )
+else
+  IO.puts("No full benchmark results yet.")
+end
+```
+
+---
+
+## 29. Visual benchmark summary
+
+```elixir
+if final_results != [] do
+  case AtpBenchmarkRunner.visualize(final_results) do
+    :ok ->
+      :ok
+
+    markdowns ->
+      Enum.each(markdowns, &IO.puts/1)
+  end
+else
+  IO.puts("No full benchmark results to visualize.")
+end
+```
+
+---
+
+## 30. Cleanup temporary SSH key
+
+Only use this when everything is finished.
+
+```elixir
+cleanup_now? = false
+
+if cleanup_now? do
+  AtpBenchmarkRunner.cleanup_livebook_setup()
+else
+  IO.puts("Cleanup skipped.")
+end
+```
