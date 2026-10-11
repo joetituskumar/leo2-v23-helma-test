@@ -1,6 +1,9 @@
-# TPTP ATP Benchmark on Helma
+# Full TPTP ATP Benchmark on Helma
 
-This notebook runs a TPTP benchmark on the Helma HPC cluster and compares the following automated theorem provers:
+This notebook runs a large-scale ATP benchmark on the Helma HPC cluster using
+the TPTP problem library.
+
+The following provers are compared:
 
 - LEO-II
 - Zipperposition
@@ -9,11 +12,13 @@ This notebook runs a TPTP benchmark on the Helma HPC cluster and compares the fo
 - LEO-III
 - ShotTx
 
-The benchmark runner handles TPTP preparation, prover images, SLURM execution, result collection, and reporting.
+The benchmark uses the full TPTP problem set and executes the workload in
+smaller chunks so that the generated Slurm arrays remain within the cluster
+limits.
 
 ---
 
-## 1. Install the benchmark runner
+## 1. Install dependencies
 
 ```elixir
 Mix.install([
@@ -27,6 +32,8 @@ Mix.install([
 
 ## 2. Configure the environment
 
+The setup form collects the HPC username, SSH key and cluster configuration.
+
 ```elixir
 setup =
   AtpBenchmarkRunner.prepare_livebook_setup(
@@ -35,7 +42,6 @@ setup =
 
 env_map = setup.env_map
 env_file = setup.env_file
-ssh_key_path = setup.ssh_key_path
 ```
 
 ---
@@ -52,7 +58,11 @@ boot =
     key_path: env_map["HPC_CONNECT_IDENTITY_FILE"]
   )
 
-session = boot.session
+session =
+  %{boot.session |
+    steady_connection: false,
+    retry_forever: true
+  }
 
 IO.inspect(
   %{
@@ -66,15 +76,36 @@ IO.inspect(
 )
 ```
 
+The benchmark uses ordinary SSH connections with automatic retries. This is
+useful when the cluster gateway temporarily refuses or closes connections.
+
 ---
 
-## 4. Prepare TPTP and select provers
+## 4. Load the full TPTP problem set
 
-Download and extract the official TPTP archive if it is not already available.
+The benchmark is pinned to TPTP 9.3.1 for reproducibility.
 
 ```elixir
+tptp_archive = %AtpBenchmarkRunner.TPTP.Archive{
+  id: :tptp_full,
+  label: "TPTP v9.3.1 full library",
+  version: "9.3.1",
+  url: "https://tptp.org/TPTP/Distribution/TPTP-v9.3.1.tgz",
+  archive_name: "TPTP-v9.3.1.tgz",
+  default?: true,
+  components: [
+    :problems,
+    :axioms,
+    :generators,
+    :documents,
+    :utilities
+  ]
+}
+
 archive_result =
-  AtpBenchmarkRunner.ensure_tptp_archive()
+  AtpBenchmarkRunner.ensure_tptp_archive(
+    archive: tptp_archive
+  )
 
 IO.inspect(
   archive_result,
@@ -82,9 +113,7 @@ IO.inspect(
 )
 ```
 
-Load all problems from the installed TPTP library.
-
-Axiom files are excluded because the benchmark operates on TPTP problems.
+### 4.1 Load problems and select provers
 
 ```elixir
 problems =
@@ -131,92 +160,487 @@ IO.puts(
 IO.puts("")
 IO.puts("Selected provers:")
 
-Enum.each(selected_provers, fn prover ->
-  IO.puts("  - #{prover}")
-end)
+Enum.each(
+  selected_provers,
+  fn prover ->
+    IO.puts("  - #{prover}")
+  end
+)
+```
+
+### 4.2 Check Slurm array limits
+
+```elixir
+array_config =
+  HpcConnect.connect!(
+    session,
+    """
+    scontrol show config | grep -E 'MaxArraySize|MaxJobCount'
+    """
+  )
+
+IO.puts(array_config)
 ```
 
 ---
 
-## 5. Run the benchmark on Helma
+## 5. Prepare and validate prover images
 
-The benchmark uses one Helma CPU node and executes prover tasks in parallel.
-
-Missing Apptainer prover images are prepared automatically before execution.
+### 5.1 Resolve prover definitions
 
 ```elixir
-plan =
-  AtpBenchmarkRunner.bootstrap(
-    session,
+prover_structs =
+  Enum.map(
     selected_provers,
-    problems,
-    mode: :hpc,
-    hpc_mode: :single_node,
-    single_node_mode: :parallel,
-    node_size: :half,
-    max_parallel_jobs: 6,
-    timeout_seconds: 30,
-    prepare_images: true,
-    extended_debug: false
+    &AtpBenchmarkRunner.Prover.builtin!/1
   )
 
-IO.puts("Run ID: #{plan.id}")
-IO.puts("Problems: #{length(problems)}")
-IO.puts("Provers: #{length(selected_provers)}")
+IO.puts("Resolved #{length(prover_structs)} prover definitions.")
+```
+
+### 5.2 Prepare the standard prover images
+
+ShotTx is handled separately in the next step because its source download
+requires explicit proxy handling on Helma.
+
+```elixir
+standard_provers =
+  Enum.reject(
+    prover_structs,
+    &(&1.name == :shot_tx)
+  )
+
+standard_images =
+  AtpBenchmarkRunner.build_prover_images!(
+    session,
+    standard_provers,
+    force: false,
+    build_on_login_node: false,
+    build_cluster: nil,
+    partition: "preempt_cpu",
+    walltime: "04:00:00",
+    cpus: 8,
+    timeout: 14_400_000
+  )
+
+IO.inspect(
+  standard_images,
+  label: "Standard prover images"
+)
+```
+
+Existing images are reused because `force: false`.
+
+### 5.3 Prepare the ShotTx image
+
+ShotTx downloads its source during the Apptainer build. On Helma, the Erlang
+HTTP client needs the cluster proxy configured explicitly.
+
+This creates a temporary definition file. It does not modify the prover
+definition stored in the repository.
+
+```elixir
+priv_dir =
+  :atp_benchmark_runner
+  |> :code.priv_dir()
+  |> to_string()
+
+original_shot_def =
+  Path.join([
+    priv_dir,
+    "provers",
+    "shot_tx",
+    "apptainer.def"
+  ])
+
+patched_shot_def =
+  Path.join(
+    System.tmp_dir!(),
+    "shot_tx_helma.def"
+  )
+
+original =
+  File.read!(original_shot_def)
+
+patched =
+  if String.contains?(original, ":https_proxy") do
+    original
+  else
+    String.replace(
+      original,
+      "      :inets.start()\n",
+      """
+            :inets.start()
+            :httpc.set_options([
+              {:proxy, {{~c"proxy.nhr.fau.de", 80}, []}},
+              {:https_proxy, {{~c"proxy.nhr.fau.de", 80}, []}}
+            ])
+      """,
+      global: false
+    )
+  end
+
+patched =
+  String.replace(
+    patched,
+    "{:timeout, 60000}",
+    "{:timeout, 300000}",
+    global: false
+  )
+
+File.write!(
+  patched_shot_def,
+  patched
+)
+
+unless String.contains?(patched, ":https_proxy") do
+  raise "ShotTx proxy configuration could not be prepared."
+end
 
 IO.puts(
-  "Prover/problem combinations: " <>
-    "#{length(problems) * length(selected_provers)}"
+  "Temporary ShotTx definition: #{patched_shot_def}"
+)
+```
+
+Build or reuse the ShotTx image:
+
+```elixir
+shot_sif =
+  HpcConnect.build_sif_blocking(
+    session,
+    "shot_tx",
+    local_def_path: patched_shot_def,
+    force_rebuild: false,
+    build_cluster: nil,
+    build_on_login_node: false,
+    use_slurm: true,
+    partition: "preempt_cpu",
+    walltime: "02:00:00",
+    cpus: 8,
+    timeout: 7_200_000
+  )
+
+IO.puts(
+  "ShotTx image: #{shot_sif}"
+)
+```
+
+### 5.4 Smoke-test all six provers
+
+Before starting the full benchmark, each prover is executed on a small
+compatible TPTP example.
+
+```elixir
+smoke_results =
+  AtpBenchmarkRunner.smoke_validate_images!(
+    session,
+    prover_structs,
+    timeout_seconds: 30
+  )
+
+Enum.each(
+  smoke_results,
+  fn result ->
+    IO.inspect(
+      %{
+        prover: result.prover,
+        problem: result.problem_id,
+        ok?: result.ok?,
+        exit_status: result.exit_status,
+        szs_status: result.szs_status
+      }
+    )
+  end
+)
+```
+
+Every prover should report `ok?: true` before continuing.
+
+---
+
+## 6. Prepare the full benchmark
+
+The full problem set is divided into chunks of 5,000 problems.
+
+This keeps each Slurm array below Helma's configured maximum array size.
+
+```elixir
+chunk_size = 5_000
+
+benchmark_chunks =
+  Enum.chunk_every(
+    problems,
+    chunk_size
+  )
+
+IO.puts(
+  "Total problems: #{length(problems)}"
 )
 
-results =
-  AtpBenchmarkRunner.run_benchmark(plan)
+IO.puts(
+  "Number of chunks: #{length(benchmark_chunks)}"
+)
+
+IO.puts("")
+
+benchmark_chunks
+|> Enum.with_index(1)
+|> Enum.each(
+  fn {chunk, index} ->
+    combinations =
+      length(chunk) *
+        length(selected_provers)
+
+    IO.puts(
+      "Chunk #{index}: " <>
+        "#{length(chunk)} problems " <>
+        "(#{combinations} prover/problem runs)"
+    )
+  end
+)
+```
+
+The benchmark configuration uses:
+
+- one CPU per prover/problem task;
+- 4 GB memory per task;
+- the `preempt_cpu` partition;
+- a 30-second prover timeout;
+- bounded parallel Slurm arrays;
+- sequential chunk submission.
+
+```elixir
+benchmark_options = [
+  mode: :hpc,
+  hpc_mode: :multi_node,
+  partition: "preempt_cpu",
+  max_parallel_jobs: 16,
+  cpus_per_task: 1,
+  ntasks: 1,
+  mem: "4000M",
+  exclusive: false,
+  timeout_seconds: 30,
+  walltime: "00:10:00",
+  wait_for_completion: true,
+  poll_interval_ms: 60_000,
+  max_wait_ms: 86_400_000,
+  prepare_images: false,
+  extended_debug: false
+]
+
+IO.inspect(
+  benchmark_options,
+  label: "Benchmark configuration"
+)
 ```
 
 ---
 
-## 6. Results
+## 7. Run the full benchmark
+
+The launch switch is deliberately disabled by default.
+
+Change it to `true` only when the setup, images, smoke tests and chunk plan have
+been verified.
 
 ```elixir
-report =
-  AtpBenchmarkRunner.report(
-    results,
-    plan
+launch_full_benchmark? = false
+```
+
+```elixir
+chunk_runs =
+  if launch_full_benchmark? do
+    benchmark_chunks
+    |> Enum.with_index(1)
+    |> Enum.map(
+      fn {chunk, index} ->
+        IO.puts("")
+        IO.puts(
+          "========================================"
+        )
+
+        IO.puts(
+          "Starting chunk #{index}/#{length(benchmark_chunks)}"
+        )
+
+        IO.puts(
+          "Problems: #{length(chunk)}"
+        )
+
+        IO.puts(
+          "Prover/problem runs: " <>
+            "#{length(chunk) * length(selected_provers)}"
+        )
+
+        IO.puts(
+          "========================================"
+        )
+
+        options =
+          Keyword.put(
+            benchmark_options,
+            :title,
+            "Full TPTP benchmark - chunk #{index}"
+          )
+
+        plan =
+          AtpBenchmarkRunner.bootstrap(
+            session,
+            selected_provers,
+            chunk,
+            options
+          )
+
+        IO.puts(
+          "Run ID: #{plan.id}"
+        )
+
+        results =
+          AtpBenchmarkRunner.run_benchmark(
+            plan
+          )
+
+        IO.puts(
+          "Chunk #{index} collected " <>
+            "#{length(results)} results."
+        )
+
+        %{
+          chunk: index,
+          run_id: plan.id,
+          plan: plan,
+          results: results
+        }
+      end
+    )
+  else
+    IO.puts(
+      "Benchmark launch is disabled."
+    )
+
+    IO.puts(
+      "Set launch_full_benchmark? = true " <>
+        "after validating the previous sections."
+    )
+
+    []
+  end
+```
+
+---
+
+## 8. Combined benchmark report
+
+Combine the results from all completed chunks.
+
+```elixir
+all_results =
+  Enum.flat_map(
+    chunk_runs,
+    & &1.results
   )
 
-AtpBenchmarkRunner.print_report_markdown(
-  report
+IO.puts(
+  "Collected results: #{length(all_results)}"
 )
 ```
 
-### Prover comparison
+Generate the aggregated comparison:
 
 ```elixir
-IO.puts("| Prover | Total | Solved | Failed | Solve Rate |")
-IO.puts("|--------|------:|-------:|-------:|-----------:|")
+full_report =
+  if all_results == [] do
+    IO.puts(
+      "No benchmark results are available yet."
+    )
 
-Enum.each(report.by_prover, fn result ->
-  IO.puts(
-    "| #{result.prover} | " <>
-      "#{result.total} | " <>
-      "#{result.solved} | " <>
-      "#{result.failed} | " <>
-      "#{Float.round(result.solve_rate * 100, 1)}% |"
-  )
-end)
+    nil
+  else
+    report =
+      AtpBenchmarkRunner.report(
+        all_results
+      )
+
+    AtpBenchmarkRunner.print_report_markdown(
+      report
+    )
+
+    report
+  end
 ```
 
-### Persist benchmark results
+### 8.1 Per-prover summary
 
 ```elixir
-paths =
-  AtpBenchmarkRunner.persist_run!(
-    plan,
-    results,
-    report
+if full_report do
+  IO.puts(
+    "| Prover | Total | Solved | Failed | Solve Rate |"
   )
 
-IO.puts("Run: #{paths.run_path}")
-IO.puts("Results: #{paths.results_path}")
-IO.puts("Report: #{paths.report_path}")
+  IO.puts(
+    "|--------|------:|-------:|-------:|-----------:|"
+  )
+
+  Enum.each(
+    full_report.by_prover,
+    fn result ->
+      IO.puts(
+        "| #{result.prover} | " <>
+          "#{result.total} | " <>
+          "#{result.solved} | " <>
+          "#{result.failed} | " <>
+          "#{Float.round(result.solve_rate * 100, 1)}% |"
+      )
+    end
+  )
+end
+```
+
+The full TPTP library contains several logical languages. Not every prover is
+intended to support every logic. Unsupported-input statuses should therefore be
+distinguished from genuine attempts when interpreting the final comparison.
+
+---
+
+## 9. Recover results from an interrupted session
+
+Every submitted HPC run has a run ID.
+
+If the Livebook session is interrupted after a chunk has been submitted, its
+results can be collected without submitting the benchmark again.
+
+### Most recent submitted run
+
+```elixir
+# recovered_results =
+#   AtpBenchmarkRunner.collect_last_hpc_results!(
+#     session
+#   )
+#
+# IO.puts(
+#   "Recovered #{length(recovered_results)} results."
+# )
+```
+
+### Specific run ID
+
+```elixir
+# recovered_results =
+#   AtpBenchmarkRunner.collect_hpc_results!(
+#     session,
+#     "run_YYYYMMDD_HHMMSS_ID"
+#   )
+```
+
+---
+
+## 10. Optional cleanup
+
+The temporary SSH key uploaded through the Livebook setup can be removed after
+the work is complete.
+
+A persistent SSH key in the user's normal `.ssh` directory is not deleted.
+
+```elixir
+# AtpBenchmarkRunner.cleanup_livebook_setup()
 ```
